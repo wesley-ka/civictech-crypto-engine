@@ -1,0 +1,31 @@
+server:
+  port: ${PORT:8080}
+  servlet:
+    context-path: /api
+
+spring:
+  application:
+    name: civictech-crypto-engine
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    serialization:
+      write_dates_as_timestamps: false
+
+# Production security configuration details
+# Keys can be overridden via environment variables in production
+crypto:
+  keys:
+    # Optional base64 encoded PKCS8 private key for ECDSA signing. If empty, a new keypair is generated on startup.
+    signing-private-key-base64: ""
+    # Optional base64 encoded PKCS8 private key for TSA. If empty, a new keypair is generated on startup.
+    tsa-private-key-base64: ""
+    # Optional 32-byte hex-encoded key for AES vault. If empty, a new key is generated on startup.
+    vault-key-hex: ""
+
+logging:
+  level:
+    root: INFO
+    com.civictech.crypto.engine: DEBUG
+    org.springframework.web: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"
