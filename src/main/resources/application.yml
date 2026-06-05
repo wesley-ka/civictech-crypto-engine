@@ -1,5 +1,5 @@
 server:
-  port: ${PORT:8080}
+  port: 8080
   servlet:
     context-path: /api
 
@@ -21,6 +21,11 @@ crypto:
     tsa-private-key-base64: ""
     # Optional 32-byte hex-encoded key for AES vault. If empty, a new key is generated on startup.
     vault-key-hex: ""
+
+  # API key for authenticating requests. Sent as Authorization: Bearer <key>.
+  # Generate a strong key with: openssl rand -hex 32
+  # Set via CRYPTO_API_KEY environment variable in production.
+  api-key: ""
 
 logging:
   level:
