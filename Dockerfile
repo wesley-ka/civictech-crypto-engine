@@ -16,5 +16,10 @@ COPY --from=builder /app/target/civictech-crypto-engine-1.0.0.jar app.jar
 RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 USER appuser
 
-EXPOSE 8080
-ENTRYPOINT ["java", "-XX:+UseG1GC", "-XX:MaxRAMPercentage=75.0", "-jar", "app.jar"]
+# Cloud Run injects PORT env var (defaults to 8080).
+# Spring Boot reads it via ${PORT:8080} in application.yml
+ENTRYPOINT ["java", \
+  "-XX:+UseG1GC", \
+  "-XX:MaxRAMPercentage=75.0", \
+  "-Djava.security.egd=file:/dev/./urandom", \
+  "-jar", "app.jar"]
