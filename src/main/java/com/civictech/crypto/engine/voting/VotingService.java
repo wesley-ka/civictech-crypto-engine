@@ -62,10 +62,16 @@ public class VotingService {
         this.objectMapper = objectMapper;
         this.deliveryServices = deliveryServices;
         this.s3Client = s3Client;
+        // In cloud environments (e.g. Cloud Run) the filesystem may be read-only.
+        // Local directory creation is best-effort: a warning is logged on failure
+        // rather than crashing startup. When B2 is configured, local storage is
+        // not required for normal operation.
         try {
             Files.createDirectories(storageRoot);
         } catch (IOException e) {
-            throw new RuntimeException("Failed to initialize voting storage directories", e);
+            log.warn("Could not create local voting-storage directory ({}). " +
+                     "This is expected in read-only cloud environments when B2 storage is configured. " +
+                     "Error: {}", storageRoot.toAbsolutePath(), e.getMessage());
         }
     }
 
