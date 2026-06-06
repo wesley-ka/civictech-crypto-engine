@@ -29,3 +29,7 @@ Thumbs.db
 ### Logs ###
 *.log
 logs/
+
+### Local Secrets & Testing ###
+src/main/resources/application-local.properties
+voting-storage/

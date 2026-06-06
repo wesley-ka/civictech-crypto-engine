@@ -52,6 +52,6 @@ public class ApiKeyAuthFilter extends OncePerRequestFilter {
     @Override
     protected boolean shouldNotFilter(HttpServletRequest request) {
         String path = request.getRequestURI();
-        return path.endsWith("/v1/health");
+        return path.endsWith("/v1/health") || path.contains("/v1/voting/static/");
     }
 }

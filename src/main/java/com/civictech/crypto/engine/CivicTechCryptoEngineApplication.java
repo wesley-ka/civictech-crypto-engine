@@ -3,10 +3,12 @@ package com.civictech.crypto.engine;
 import org.bouncycastle.jce.provider.BouncyCastleProvider;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 import java.security.Security;
 
 @SpringBootApplication
+@EnableScheduling
 public class CivicTechCryptoEngineApplication {
 
     static {

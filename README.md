@@ -57,9 +57,15 @@ civictech-crypto-engine/
     │   │                   │   ├── TsaController.java
     │   │                   │   ├── TsaService.java
     │   │                   │   └── dto/
-    │   │                   └── vault
-    │   │                       ├── VaultController.java
-    │   │                       ├── VaultService.java
+    │   │                   ├── vault
+    │   │                   │   ├── VaultController.java
+    │   │                   │   ├── VaultService.java
+    │   │                   │   └── dto/
+    │   │                   └── voting
+    │   │                       ├── VotingController.java
+    │   │                       ├── VotingService.java
+    │   │                       ├── TelegramResultDeliveryService.java
+    │   │                       ├── VotingResultDeliveryService.java
     │   │                       └── dto/
     │   └── resources
     │       └── application.yml
@@ -194,6 +200,25 @@ The Timestamping Authority (TSA) module creates digitally signed timestamp token
 * It binds a SHA-256 hash of a document/transaction with a trusted system date and time.
 * It signs the response token using an ECDSA key configured with the critical `id-kp-timeStamping` Extended Key Usage (EKU) extension.
 * The output token is formatted as a DER-encoded Cryptographic Message Syntax (CMS) structure, ensuring complete interoperability with standard document signing software (like Adobe Acrobat or DocuSign).
+
+### 3.6 Ephemeral ZKP-Verified Voting Protocol & UOC Master's Thesis Implementation
+This module provides a database-free, highly scalable, and privacy-preserving electronic voting protocol based on Zero-Knowledge Proofs (Schnorr Non-Interactive Zero-Knowledge Proofs).
+
+> [!NOTE]
+> **Academic Basis & Context**
+> This voting implementation is a practical adaptation of the UOC (Universitat Oberta de Catalunya) Master's Thesis (**Trabajo Fin de Máster - TFM**):
+> * **Title:** *Zero-Knowledge Technology in Blockchain*
+> * **Objective:** Developed a privacy-preserving blockchain framework using Zero-Knowledge Proofs, with a prototype for secure, auditable electronic voting.
+> * **Tutor:** Javier Rodríguez Fernández
+> * **SRP (Second Reader):** Carlos Núñez Gómez
+
+#### Protocol Mechanics:
+1. **Creation**: An administrator creates a voting session with a custom expiration time and a Telegram reporting chat ID.
+2. **Interactive Challenge**: To cast a vote, the voter generates a unique cryptographic nullifier (derived from a private passphrase and the `vote_id`) and registers it to receive a session-bound challenge.
+3. **Ballot Casting (ZKP)**: The voter computes a non-interactive Schnorr proof of knowledge of the private key matching their registered public identity. The server verifies this ZKP, records the vote, and logs the nullifier to prevent double voting.
+4. **Voter Anonymity (No-Link at Rest)**: The backend decouples voter identities (nullifiers) from their candidate selections by storing them in separate directories (`nullifiers/` and `ballots/`). Since ballots are written as randomized JSON objects with no timestamps or metadata linked back to the nullifiers, there is no cryptographic or physical linkage between the voter's identity and their selection.
+5. **Double-Voting Prevention (No Database)**: To remain fully stateless and database-free, the engine writes nullifiers atomically to the local file system (simulating S3 conditional writes like `If-None-Match: *`). If a voter tries to vote twice, the second file write fails, and the ballot is rejected.
+6. **Automatic Purging & Delivery**: Every 15 seconds, a scheduler checks for expired sessions. Upon expiration, it compiles the results, generates a **Unified JSON Audit Package** and a **Markdown Verification Guide**, uploads them to B2 Object Storage (or local storage), delivers the results directly to the creator's Telegram chat, and purges all voter-identifying nullifiers and ballot files, achieving zero persistent storage costs.
 
 ---
 
@@ -414,6 +439,113 @@ curl -X POST http://localhost:8080/api/v1/tsa/timestamp \
   "public_key_y": "8f89e2c2..."
 }
 ```
+
+---
+
+### Module 6: Ephemeral ZKP Voting Service
+
+#### 1. Create a Voting Session
+* **Endpoint**: `POST /api/v1/voting/create`
+* **Description**: Initializes an ephemeral voting session.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/voting/create \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "Decentralized Governance Election",
+    "candidates": ["Alice", "Bob"],
+    "duration_minutes": 5,
+    "delivery_target": "-100123456789"
+  }'
+```
+* **Expected Response**:
+```json
+{
+  "vote_id": "18d3104c-7e33-4e42-8159-db0162db8af6",
+  "expires_at": "2026-06-06T13:05:39.741518Z"
+}
+```
+
+#### 2. Fetch Voting Session Info
+* **Endpoint**: `GET /api/v1/voting/info/{voteId}`
+* **Description**: Returns non-sensitive public configurations of the voting session (e.g., expiry date/time).
+* **Request**:
+```bash
+curl -X GET http://localhost:8080/api/v1/voting/info/18d3104c-7e33-4e42-8159-db0162db8af6 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+* **Expected Response**:
+```json
+{
+  "vote_id": "18d3104c-7e33-4e42-8159-db0162db8af6",
+  "title": "Decentralized Governance Election",
+  "candidates": ["Alice", "Bob"],
+  "expires_at": "2026-06-06T13:05:39.741518Z",
+  "active": true
+}
+```
+
+#### 3. Request Challenge (Interactive ZKP Flow)
+* **Endpoint**: `POST /api/v1/voting/challenge`
+* **Description**: Requests a unique session challenge bound to the voter's nullifier.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/voting/challenge \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vote_id": "18d3104c-7e33-4e42-8159-db0162db8af6",
+    "nullifier": "528ed970719d58e0b1934f90789a8e1c34a20fca1251b0a3f22d649aac55d5ca",
+    "public_key_x": "18e61b4c513dd59876f75722b6b26a8fc5f68bf45868e0dc301cd43a2ae745ad",
+    "public_key_y": "9be1f472d9f6d37be61821cf2b887fb7bdbfc9a1fa6afa3a8413024f2f37b930"
+  }'
+```
+* **Expected Response**:
+```json
+{
+  "challenge": "7329d840754a514688283dc2fce126dec65caf80d72b9c5c2fdbf6472f5d55d0"
+}
+```
+
+#### 4. Cast Ballot with ZKP Proof
+* **Endpoint**: `POST /api/v1/voting/cast`
+* **Description**: Verifies the Schnorr zero-knowledge proof of public key eligibility and casts the ballot.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/voting/cast \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "vote_id": "18d3104c-7e33-4e42-8159-db0162db8af6",
+    "nullifier": "528ed970719d58e0b1934f90789a8e1c34a20fca1251b0a3f22d649aac55d5ca",
+    "candidate_id": "Alice",
+    "commitment_hash": "08a7f6ff03f65fbed2d158a265b4191c320895a571810f7795bcdf1da9600707",
+    "commitment_x": "18e61b4c513dd59876f75722b6b26a8fc5f68bf45868e0dc301cd43a2ae745ad",
+    "commitment_y": "9be1f472d9f6d37be61821cf2b887fb7bdbfc9a1fa6afa3a8413024f2f37b930",
+    "challenge": "7329d840754a514688283dc2fce126dec65caf80d72b9c5c2fdbf6472f5d55d0",
+    "response": "5eba4905cf500e687dc2f654c9df903e02ec44ab7532dc9818fecc09403955ef",
+    "public_key_x": "18e61b4c513dd59876f75722b6b26a8fc5f68bf45868e0dc301cd43a2ae745ad",
+    "public_key_y": "9be1f472d9f6d37be61821cf2b887fb7bdbfc9a1fa6afa3a8413024f2f37b930"
+  }'
+```
+* **Expected Response**:
+```json
+{
+  "status": "VOTE_CAST_SUCCESSFULLY"
+}
+```
+
+#### 5. Fetch Final Results (Issues relative redirect to results)
+* **Endpoint**: `GET /api/v1/voting/results/{voteId}`
+* **Description**: Checks session expiration. If expired, compiles results to static file, triggers Telegram push, and redirects to static JSON (e.g. `/api/v1/voting/static/{voteId}/results.json`).
+* **Request**:
+```bash
+curl -i -L -H "Authorization: Bearer YOUR_API_KEY" \
+  http://localhost:8080/api/v1/voting/results/18d3104c-7e33-4e42-8159-db0162db8af6
+```
+* **Expected Response (Redirect followed)**:
+Returns the final archived results JSON file containing the audit package, tallies, and verification guide.
 
 ---
 

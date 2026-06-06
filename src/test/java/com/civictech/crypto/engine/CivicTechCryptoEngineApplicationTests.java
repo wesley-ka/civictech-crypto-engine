@@ -6,6 +6,12 @@ import com.civictech.crypto.engine.certificates.dto.ParseCertificateResponse;
 import com.civictech.crypto.engine.identity.ZkpService;
 import com.civictech.crypto.engine.identity.dto.ZkpVerifyRequest;
 import com.civictech.crypto.engine.identity.dto.ZkpVerifyResponse;
+import com.civictech.crypto.engine.voting.VotingService;
+import com.civictech.crypto.engine.voting.dto.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Instant;
 import com.civictech.crypto.engine.signing.SigningService;
 import com.civictech.crypto.engine.signing.dto.SignRequest;
 import com.civictech.crypto.engine.signing.dto.SignResponse;
@@ -43,6 +49,7 @@ import java.security.spec.ECGenParameterSpec;
 import java.util.Base64;
 import java.util.Date;
 import java.util.Map;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -64,6 +71,11 @@ class CivicTechCryptoEngineApplicationTests {
     @Autowired
     private TsaService tsaService;
 
+    @Autowired
+    private VotingService votingService;
+
+    @Autowired
+    private com.fasterxml.jackson.databind.ObjectMapper objectMapper;
 
 
     @Test
@@ -229,6 +241,109 @@ class CivicTechCryptoEngineApplicationTests {
         assertEquals("SHA-256", response.hashAlgorithm());
         assertEquals(testHashHex, response.documentHash());
         assertNotNull(response.signature());
+    }
+
+    @Test
+    void testModule6_ZkpVotingService() throws Exception {
+        // 1. Create a voting session
+        CreateVotingSessionRequest createReq = new CreateVotingSessionRequest(
+                "Test Election",
+                List.of("Alice", "Bob", "Charlie"),
+                1, // 1 minute
+                "telegram:123456"
+        );
+        CreateVotingSessionResponse createRes = votingService.createSession(createReq);
+        String voteId = createRes.voteId();
+        assertNotNull(voteId);
+
+        // 2. Fetch info and verify active
+        VotingSessionInfo info = votingService.getSessionInfo(voteId);
+        assertTrue(info.active());
+        assertEquals("Test Election", info.title());
+
+        // 3. Verify early results retrieval throws exception
+        assertThrows(IllegalArgumentException.class, () -> votingService.getResultsUrl(voteId, "http", "localhost", 8080, "/api"));
+
+        // 4. Mathematically generate a valid Schnorr proof over secp256r1
+        org.bouncycastle.asn1.x9.X9ECParameters curveParams = org.bouncycastle.asn1.x9.ECNamedCurveTable.getByName("secp256r1");
+        org.bouncycastle.math.ec.ECPoint g = curveParams.getG();
+        BigInteger n = curveParams.getN();
+
+        BigInteger x = new BigInteger("98765432101234567890");
+        org.bouncycastle.math.ec.ECPoint y = g.multiply(x).normalize();
+
+        // 5. Request a challenge
+        String nullifier = "nullifier-test-hash-123";
+        ChallengeRequest challengeReq = new ChallengeRequest(
+                voteId,
+                nullifier,
+                y.getAffineXCoord().toBigInteger().toString(16),
+                y.getAffineYCoord().toBigInteger().toString(16)
+        );
+        ChallengeResponse challengeRes = votingService.generateChallenge(challengeReq);
+        String challengeHex = challengeRes.challenge();
+        assertNotNull(challengeHex);
+
+        // 6. Generate proof response s = k + c * x (mod n)
+        BigInteger k = new BigInteger("1234567890987654321");
+        org.bouncycastle.math.ec.ECPoint r = g.multiply(k).normalize();
+        byte[] rEncoded = r.getEncoded(true);
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        byte[] computedRHash = digest.digest(rEncoded);
+        String commitmentHash = Hex.toHexString(computedRHash);
+
+        BigInteger c = new BigInteger(challengeHex, 16);
+        BigInteger s = k.add(c.multiply(x)).mod(n);
+
+        // 7. Cast vote
+        CastVoteRequest castReq = new CastVoteRequest(
+                voteId,
+                nullifier,
+                "Alice",
+                commitmentHash,
+                r.getAffineXCoord().toBigInteger().toString(16),
+                r.getAffineYCoord().toBigInteger().toString(16),
+                challengeHex,
+                s.toString(16),
+                y.getAffineXCoord().toBigInteger().toString(16),
+                y.getAffineYCoord().toBigInteger().toString(16),
+                null,
+                null
+        );
+        votingService.castVote(castReq);
+
+        // 8. Verify double-voting is rejected
+        assertThrows(IllegalArgumentException.class, () -> votingService.castVote(castReq));
+
+        // 9. Manually expire the session by modifying metadata.json
+        Path metadataPath = Paths.get("./voting-storage").resolve(voteId).resolve("metadata.json");
+        Map<String, Object> metadataMap = objectMapper.readValue(metadataPath.toFile(), Map.class);
+        
+        // Put expires_at in the past
+        metadataMap.put("expires_at", Instant.now().minusSeconds(10).toString());
+        Files.writeString(metadataPath, objectMapper.writeValueAsString(metadataMap));
+
+        // 10. Fetch results URL (this triggers finalization, deletion of subdirs and delivery)
+        String redirectUrl = votingService.getResultsUrl(voteId, "http", "localhost", 8080, "/api");
+        assertNotNull(redirectUrl);
+        assertTrue(redirectUrl.contains("/v1/voting/static/" + voteId + "/results.json"));
+
+        // 11. Read the static results file from storage (simulating S3 get)
+        byte[] resultsBytes = votingService.getStaticResultsFile(voteId);
+        VotingResultsResponse results = objectMapper.readValue(resultsBytes, VotingResultsResponse.class);
+        
+        assertEquals("COMPLETED", results.status());
+        assertEquals(1, results.totalVotes());
+        assertEquals(1, results.tallies().get("alice"));
+        assertEquals(0, results.tallies().get("bob"));
+        assertNotNull(results.verificationGuide());
+        assertFalse(results.verificationGuide().isEmpty());
+
+        // Verify folders are purged
+        Path nullifiersDir = Paths.get("./voting-storage").resolve(voteId).resolve("nullifiers");
+        Path ballotsDir = Paths.get("./voting-storage").resolve(voteId).resolve("ballots");
+        assertFalse(Files.exists(nullifiersDir));
+        assertFalse(Files.exists(ballotsDir));
     }
 }
 

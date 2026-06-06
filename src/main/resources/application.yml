@@ -6,10 +6,25 @@ server:
 spring:
   application:
     name: civictech-crypto-engine
+  profiles:
+    active: ${SPRING_PROFILES_ACTIVE:local}
   jackson:
     property-naming-strategy: SNAKE_CASE
     serialization:
       write_dates_as_timestamps: false
+
+voting:
+  telegram:
+    bot-token: ${VOTING_TELEGRAM_BOT_TOKEN:}
+  storage:
+    type: ${VOTING_STORAGE_TYPE:local}
+    b2:
+      endpoint: ${B2_ENDPOINT:}
+      bucket-name: ${B2_BUCKET_NAME:}
+      access-key: ${B2_ACCESS_KEY:}
+      secret-key: ${B2_SECRET_KEY:}
+      region: ${B2_REGION:us-east-1}
+
 
 # Production security configuration details
 # Keys can be overridden via environment variables in production

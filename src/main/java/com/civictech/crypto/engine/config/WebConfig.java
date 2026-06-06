@@ -10,7 +10,7 @@ public class WebConfig implements WebMvcConfigurer {
     @Override
     public void addCorsMappings(CorsRegistry registry) {
         // Allow local development and testing tools to consume the cryptographic engine APIs
-        registry.addMapping("/api/v1/**")
+        registry.addMapping("/v1/**")
                 .allowedOrigins("*")
                 .allowedMethods("POST", "GET", "OPTIONS")
                 .allowedHeaders("*")
