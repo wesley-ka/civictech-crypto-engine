@@ -15,9 +15,7 @@ import org.springframework.stereotype.Service;
 import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.services.s3.S3Client;
-import software.amazon.awssdk.services.s3.model.GetObjectRequest;
-import software.amazon.awssdk.services.s3.model.GetObjectResponse;
-import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.*;
 
 import java.io.File;
 import java.io.IOException;
@@ -39,17 +37,15 @@ public class VotingService {
     private final ObjectMapper objectMapper;
     private final List<VotingResultDeliveryService> deliveryServices;
     private final SecureRandom secureRandom = new SecureRandom();
-    private final Path storageRoot = Paths.get("./voting-storage");
+
+    // Only used when storageType=local
+    private final Path storageRoot;
 
     private final Map<String, ChallengeSession> activeChallenges = new ConcurrentHashMap<>();
     private static final long SESSION_EXPIRATION_MS = 300_000; // 5 minutes
 
-    @Value("${voting.storage.type:local}")
-    private String storageType;
-
-    @Value("${voting.storage.b2.bucket-name:}")
-    private String bucketName;
-
+    private final String storageType;
+    private final String bucketName;
     private final S3Client s3Client;
 
     public record ChallengeSession(String challenge, String publicKeyX, String publicKeyY, long createdAt) {}
@@ -57,23 +53,102 @@ public class VotingService {
     public VotingService(ZkpService zkpService,
                          ObjectMapper objectMapper,
                          List<VotingResultDeliveryService> deliveryServices,
-                         @Autowired(required = false) S3Client s3Client) {
+                         @Autowired(required = false) S3Client s3Client,
+                         @Value("${voting.storage.type:local}") String storageType,
+                         @Value("${voting.storage.b2.bucket-name:}") String bucketName) {
         this.zkpService = zkpService;
         this.objectMapper = objectMapper;
         this.deliveryServices = deliveryServices;
         this.s3Client = s3Client;
-        // In cloud environments (e.g. Cloud Run) the filesystem may be read-only.
-        // Local directory creation is best-effort: a warning is logged on failure
-        // rather than crashing startup. When B2 is configured, local storage is
-        // not required for normal operation.
-        try {
-            Files.createDirectories(storageRoot);
-        } catch (IOException e) {
-            log.warn("Could not create local voting-storage directory ({}). " +
-                     "This is expected in read-only cloud environments when B2 storage is configured. " +
-                     "Error: {}", storageRoot.toAbsolutePath(), e.getMessage());
+        this.storageType = storageType;
+        this.bucketName = bucketName;
+
+        // Local filesystem storage is only used when storageType=local.
+        // When storageType=b2, all state lives in Backblaze B2 — no local disk needed.
+        this.storageRoot = Paths.get("./voting-storage");
+        if (!isB2()) {
+            try {
+                Files.createDirectories(storageRoot);
+            } catch (IOException e) {
+                throw new RuntimeException(
+                    "Failed to create local voting storage directory '" + storageRoot.toAbsolutePath() + "'", e);
+            }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Storage routing helpers
+    // -----------------------------------------------------------------------
+
+    private boolean isB2() {
+        return "b2".equalsIgnoreCase(storageType) && s3Client != null;
+    }
+
+    /** Read a B2 object as bytes. Returns empty Optional if key does not exist. */
+    private Optional<byte[]> b2Get(String key) {
+        try {
+            ResponseBytes<GetObjectResponse> obj = s3Client.getObjectAsBytes(
+                GetObjectRequest.builder().bucket(bucketName).key(key).build());
+            return Optional.of(obj.asByteArray());
+        } catch (NoSuchKeyException e) {
+            return Optional.empty();
+        }
+    }
+
+    /** Write bytes to a B2 key. */
+    private void b2Put(String key, byte[] data, String contentType) {
+        s3Client.putObject(PutObjectRequest.builder()
+                .bucket(bucketName)
+                .key(key)
+                .contentType(contentType)
+                .build(),
+                RequestBody.fromBytes(data));
+    }
+
+    /** Returns true if a B2 key exists (zero-byte HEAD). */
+    private boolean b2Exists(String key) {
+        try {
+            s3Client.headObject(HeadObjectRequest.builder().bucket(bucketName).key(key).build());
+            return true;
+        } catch (NoSuchKeyException e) {
+            return false;
+        }
+    }
+
+    /** List B2 keys under a common prefix. */
+    private List<String> b2List(String prefix) {
+        List<String> keys = new ArrayList<>();
+        ListObjectsV2Response response = s3Client.listObjectsV2(
+                ListObjectsV2Request.builder().bucket(bucketName).prefix(prefix).build());
+        for (S3Object obj : response.contents()) {
+            keys.add(obj.key());
+        }
+        return keys;
+    }
+
+    /** Read + deserialize a JSON object from B2. Returns empty Optional if missing. */
+    private Optional<Map<String, Object>> b2GetJson(String key) {
+        return b2Get(key).map(bytes -> {
+            try {
+                return objectMapper.readValue(bytes, Map.class);
+            } catch (IOException e) {
+                throw new CryptoException("Failed to deserialize B2 object: " + key, e);
+            }
+        });
+    }
+
+    /** Serialize + write a JSON object to B2. */
+    private void b2PutJson(String key, Object value) {
+        try {
+            b2Put(key, objectMapper.writeValueAsBytes(value), "application/json");
+        } catch (IOException e) {
+            throw new CryptoException("Failed to serialize B2 object: " + key, e);
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Public API
+    // -----------------------------------------------------------------------
 
     public CreateVotingSessionResponse createSession(CreateVotingSessionRequest request) {
         String voteId = UUID.randomUUID().toString();
@@ -89,59 +164,73 @@ public class VotingService {
         metadata.put("delivery_target", request.deliveryTarget() != null ? request.deliveryTarget().trim() : "");
         metadata.put("status", "ACTIVE");
 
-        try {
-            Path sessionDir = storageRoot.resolve(voteId);
-            Files.createDirectories(sessionDir.resolve("nullifiers"));
-            Files.createDirectories(sessionDir.resolve("ballots"));
-
-            // Write metadata file
-            Files.writeString(sessionDir.resolve("metadata.json"), objectMapper.writeValueAsString(metadata));
-        } catch (IOException e) {
-            throw new CryptoException("Failed to create voting session directories", e);
+        if (isB2()) {
+            // All session state lives in B2 — no local disk required
+            b2PutJson(voteId + "/metadata.json", metadata);
+            log.info("Created voting session in B2: {}", voteId);
+        } else {
+            try {
+                Path sessionDir = storageRoot.resolve(voteId);
+                Files.createDirectories(sessionDir.resolve("nullifiers"));
+                Files.createDirectories(sessionDir.resolve("ballots"));
+                Files.writeString(sessionDir.resolve("metadata.json"), objectMapper.writeValueAsString(metadata));
+            } catch (IOException e) {
+                throw new CryptoException("Failed to create voting session directories", e);
+            }
         }
 
         return new CreateVotingSessionResponse(voteId, expiresAt.toString(), creatorToken);
     }
 
     public VotingSessionInfo getSessionInfo(String voteId) {
-        Path metadataPath = storageRoot.resolve(voteId).resolve("metadata.json");
-        if (!Files.exists(metadataPath)) {
-            throw new IllegalArgumentException("Voting session not found.");
+        Map<String, Object> meta;
+
+        if (isB2()) {
+            meta = b2GetJson(voteId + "/metadata.json")
+                    .orElseThrow(() -> new IllegalArgumentException("Voting session not found."));
+        } else {
+            Path metadataPath = storageRoot.resolve(voteId).resolve("metadata.json");
+            if (!Files.exists(metadataPath)) {
+                throw new IllegalArgumentException("Voting session not found.");
+            }
+            try {
+                meta = objectMapper.readValue(metadataPath.toFile(), Map.class);
+            } catch (IOException e) {
+                throw new CryptoException("Failed to read voting session metadata", e);
+            }
         }
 
-        try {
-            Map<String, Object> meta = objectMapper.readValue(metadataPath.toFile(), Map.class);
-            Instant expiresAt = Instant.parse((String) meta.get("expires_at"));
-            
-            // Check active status
-            String status = (String) meta.getOrDefault("status", "ACTIVE");
-            boolean active = "ACTIVE".equalsIgnoreCase(status) && Instant.now().isBefore(expiresAt);
+        Instant expiresAt = Instant.parse((String) meta.get("expires_at"));
+        String status = (String) meta.getOrDefault("status", "ACTIVE");
+        boolean active = "ACTIVE".equalsIgnoreCase(status) && Instant.now().isBefore(expiresAt);
 
-            return new VotingSessionInfo(
-                    voteId,
-                    (String) meta.get("title"),
-                    (List<String>) meta.get("candidates"),
-                    expiresAt.toString(),
-                    active
-            );
-        } catch (IOException e) {
-            throw new CryptoException("Failed to read voting session metadata", e);
-        }
+        return new VotingSessionInfo(
+                voteId,
+                (String) meta.get("title"),
+                (List<String>) meta.get("candidates"),
+                expiresAt.toString(),
+                active
+        );
     }
 
     public ChallengeResponse generateChallenge(ChallengeRequest request) {
         String voteId = request.voteId().trim();
         String nullifier = request.nullifier().trim().toLowerCase();
-        
+
         // 1. Verify session exists and is active
         VotingSessionInfo info = getSessionInfo(voteId);
         if (!info.active()) {
             throw new IllegalArgumentException("Voting session has expired or is completed.");
         }
 
-        // 2. Check if nullifier has already voted (Double voting prevention)
-        Path nullifierPath = storageRoot.resolve(voteId).resolve("nullifiers").resolve(nullifier);
-        if (Files.exists(nullifierPath)) {
+        // 2. Check if nullifier has already voted (double vote prevention)
+        boolean nullifierUsed;
+        if (isB2()) {
+            nullifierUsed = b2Exists(voteId + "/nullifiers/" + nullifier);
+        } else {
+            nullifierUsed = Files.exists(storageRoot.resolve(voteId).resolve("nullifiers").resolve(nullifier));
+        }
+        if (nullifierUsed) {
             throw new IllegalArgumentException("Voter nullifier has already cast a vote in this session.");
         }
 
@@ -150,7 +239,7 @@ public class VotingService {
         secureRandom.nextBytes(challengeBytes);
         String challengeHex = HexFormat.of().formatHex(challengeBytes);
 
-        // 4. Store active challenge session in-memory
+        // 4. Store active challenge session in-memory (short-lived, 5 min TTL)
         String sessionKey = voteId + ":" + nullifier;
         activeChallenges.put(sessionKey, new ChallengeSession(
                 challengeHex,
@@ -218,18 +307,23 @@ public class VotingService {
             throw new CryptoException("Invalid zero-knowledge proof verification failed.");
         }
 
-        // 4. Double Vote Prevention: Write nullifier atomically
-        Path nullifierPath = storageRoot.resolve(voteId).resolve("nullifiers").resolve(nullifier);
-        try {
-            Files.createFile(nullifierPath);
-        } catch (IOException e) {
-            throw new IllegalArgumentException("Double voting detected. Nullifier already used.");
+        // 4. Double Vote Prevention: write nullifier marker atomically
+        if (isB2()) {
+            if (b2Exists(voteId + "/nullifiers/" + nullifier)) {
+                throw new IllegalArgumentException("Double voting detected. Nullifier already used.");
+            }
+            b2Put(voteId + "/nullifiers/" + nullifier, new byte[0], "application/octet-stream");
+        } else {
+            Path nullifierPath = storageRoot.resolve(voteId).resolve("nullifiers").resolve(nullifier);
+            try {
+                Files.createFile(nullifierPath);
+            } catch (IOException e) {
+                throw new IllegalArgumentException("Double voting detected. Nullifier already used.");
+            }
         }
 
-        // 5. Save ballot anonymously (Write to a random UUID to decouple vote from nullifier)
+        // 5. Save ballot anonymously (random UUID decouples vote from nullifier)
         String ballotId = UUID.randomUUID().toString();
-        Path ballotPath = storageRoot.resolve(voteId).resolve("ballots").resolve(ballotId + ".json");
-        
         Map<String, Object> ballotData = Map.of(
                 "candidate_id", candidateId,
                 "commitment_hash", request.commitmentHash(),
@@ -239,64 +333,70 @@ public class VotingService {
                 "response", request.response()
         );
 
-        try {
-            Files.writeString(ballotPath, objectMapper.writeValueAsString(ballotData));
-        } catch (IOException e) {
-            try { Files.deleteIfExists(nullifierPath); } catch (Exception ignored) {}
-            throw new CryptoException("Failed to store anonymized ballot.", e);
+        if (isB2()) {
+            b2PutJson(voteId + "/ballots/" + ballotId + ".json", ballotData);
+        } else {
+            Path ballotPath = storageRoot.resolve(voteId).resolve("ballots").resolve(ballotId + ".json");
+            try {
+                Files.writeString(ballotPath, objectMapper.writeValueAsString(ballotData));
+            } catch (IOException e) {
+                // Rollback nullifier on ballot write failure (local only)
+                try {
+                    Files.deleteIfExists(storageRoot.resolve(voteId).resolve("nullifiers").resolve(nullifier));
+                } catch (Exception ignored) {}
+                throw new CryptoException("Failed to store anonymized ballot.", e);
+            }
         }
 
         // 6. Cleanup challenge session
         activeChallenges.remove(sessionKey);
     }
 
-    public String getResultsUrl(String voteId, String requestScheme, String requestServerName, int requestServerPort, String contextPath) {
-        Path sessionDir = storageRoot.resolve(voteId);
-        Path metadataPath = sessionDir.resolve("metadata.json");
-        if (!Files.exists(metadataPath)) {
-            throw new IllegalArgumentException("Voting session not found.");
+    public String getResultsUrl(String voteId, String requestScheme, String requestServerName,
+                                int requestServerPort, String contextPath) {
+        Map<String, Object> meta;
+        if (isB2()) {
+            meta = b2GetJson(voteId + "/metadata.json")
+                    .orElseThrow(() -> new IllegalArgumentException("Voting session not found."));
+        } else {
+            Path metadataPath = storageRoot.resolve(voteId).resolve("metadata.json");
+            if (!Files.exists(metadataPath)) {
+                throw new IllegalArgumentException("Voting session not found.");
+            }
+            try {
+                meta = objectMapper.readValue(metadataPath.toFile(), Map.class);
+            } catch (IOException e) {
+                throw new CryptoException("Failed to read voting session metadata", e);
+            }
         }
 
-        try {
-            Map<String, Object> meta = objectMapper.readValue(metadataPath.toFile(), Map.class);
-            
-            // Check status. If completed, load direct results
-            String status = (String) meta.getOrDefault("status", "ACTIVE");
-            if ("ACTIVE".equalsIgnoreCase(status)) {
-                Instant expiresAt = Instant.parse((String) meta.get("expires_at"));
-                if (Instant.now().isBefore(expiresAt)) {
-                    throw new IllegalArgumentException("Voting session is still active. Results will be released at " + expiresAt);
-                }
-                // If expired but not marked completed, finalize now
+        String status = (String) meta.getOrDefault("status", "ACTIVE");
+        if ("ACTIVE".equalsIgnoreCase(status)) {
+            Instant expiresAt = Instant.parse((String) meta.get("expires_at"));
+            if (Instant.now().isBefore(expiresAt)) {
+                throw new IllegalArgumentException("Voting session is still active. Results will be released at " + expiresAt);
+            }
+            // Expired but not yet finalized — do it now
+            try {
                 finalizeSession(voteId, meta);
+            } catch (IOException e) {
+                throw new CryptoException("Failed to finalize voting session", e);
             }
-
-            // Return S3/B2 CDN URL if configured, otherwise fallback to local redirect
-            String cdnUrl = System.getenv("B2_CDN_URL");
-            if (cdnUrl != null && !cdnUrl.isBlank()) {
-                return cdnUrl.trim() + "/" + voteId + "/results.json";
-            }
-
-            // Local fallback redirect URL (relative path to preserve proxying/origins)
-            return contextPath + "/v1/voting/static/" + voteId + "/results.json";
-
-        } catch (IOException e) {
-            throw new CryptoException("Failed to read voting session metadata", e);
         }
+
+        // Return B2 CDN URL if configured, otherwise fallback to local static endpoint
+        String cdnUrl = System.getenv("B2_CDN_URL");
+        if (cdnUrl != null && !cdnUrl.isBlank()) {
+            return cdnUrl.trim() + "/" + voteId + "/results.json";
+        }
+
+        return contextPath + "/v1/voting/static/" + voteId + "/results.json";
     }
 
     public byte[] getStaticResultsFile(String voteId) {
-        if ("b2".equalsIgnoreCase(storageType) && s3Client != null) {
-            try {
-                log.info("Fetching static results from Backblaze B2 for voteId: {}", voteId);
-                ResponseBytes<GetObjectResponse> s3Object = s3Client.getObjectAsBytes(GetObjectRequest.builder()
-                        .bucket(bucketName)
-                        .key(voteId + "/results.json")
-                        .build());
-                return s3Object.asByteArray();
-            } catch (Exception e) {
-                log.warn("Failed to fetch static results from B2 for voteId: {}, falling back to local file checks", voteId, e);
-            }
+        if (isB2()) {
+            return b2Get(voteId + "/results.json")
+                    .orElseThrow(() -> new IllegalArgumentException("Finalized results not found."));
         }
 
         Path path = storageRoot.resolve(voteId).resolve("results.json");
@@ -310,46 +410,73 @@ public class VotingService {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Finalization
+    // -----------------------------------------------------------------------
+
     private synchronized void finalizeSession(String voteId, Map<String, Object> meta) throws IOException {
-        Path sessionDir = storageRoot.resolve(voteId);
-        
-        // Re-read metadata to ensure no double-finalization
-        Map<String, Object> currentMeta = objectMapper.readValue(sessionDir.resolve("metadata.json").toFile(), Map.class);
+        // Re-read metadata to prevent double-finalization
+        Map<String, Object> currentMeta;
+        if (isB2()) {
+            currentMeta = b2GetJson(voteId + "/metadata.json")
+                    .orElseThrow(() -> new IllegalArgumentException("Voting session not found during finalization."));
+        } else {
+            Path sessionDir = storageRoot.resolve(voteId);
+            currentMeta = objectMapper.readValue(sessionDir.resolve("metadata.json").toFile(), Map.class);
+        }
+
         if ("COMPLETED".equalsIgnoreCase((String) currentMeta.getOrDefault("status", "ACTIVE"))) {
             return;
         }
 
         log.info("Finalizing voting session: {}", voteId);
 
-        // Read all nullifiers
-        File[] nullifierFiles = sessionDir.resolve("nullifiers").toFile().listFiles();
+        // Collect nullifiers
         List<String> nullifiersList = new ArrayList<>();
-        if (nullifierFiles != null) {
-            for (File f : nullifierFiles) {
-                nullifiersList.add(f.getName());
+        if (isB2()) {
+            for (String key : b2List(voteId + "/nullifiers/")) {
+                nullifiersList.add(key.substring((voteId + "/nullifiers/").length()));
+            }
+        } else {
+            File[] nullifierFiles = storageRoot.resolve(voteId).resolve("nullifiers").toFile().listFiles();
+            if (nullifierFiles != null) {
+                for (File f : nullifierFiles) nullifiersList.add(f.getName());
             }
         }
 
-        // Read all ballots and calculate tallies
-        File[] ballotFiles = sessionDir.resolve("ballots").toFile().listFiles();
+        // Collect ballots and tally
         List<Map<String, Object>> ballotsList = new ArrayList<>();
         Map<String, Integer> tallies = new HashMap<>();
-        
         List<String> candidateList = (List<String>) currentMeta.get("candidates");
         for (String candidate : candidateList) {
             tallies.put(candidate.toLowerCase(), 0);
         }
 
         int totalVotes = 0;
-        if (ballotFiles != null) {
-            for (File f : ballotFiles) {
-                Map<String, Object> ballot = objectMapper.readValue(f, Map.class);
-                ballotsList.add(ballot);
-                String candidateId = ((String) ballot.get("candidate_id")).toLowerCase();
-                if (tallies.containsKey(candidateId)) {
-                    tallies.put(candidateId, tallies.get(candidateId) + 1);
-                    totalVotes++;
+        if (isB2()) {
+            for (String key : b2List(voteId + "/ballots/")) {
+                b2Get(key).ifPresent(bytes -> {
+                    try {
+                        ballotsList.add(objectMapper.readValue(bytes, Map.class));
+                    } catch (IOException e) {
+                        log.warn("Failed to deserialize ballot from B2 key: {}", key, e);
+                    }
+                });
+            }
+        } else {
+            File[] ballotFiles = storageRoot.resolve(voteId).resolve("ballots").toFile().listFiles();
+            if (ballotFiles != null) {
+                for (File f : ballotFiles) {
+                    ballotsList.add(objectMapper.readValue(f, Map.class));
                 }
+            }
+        }
+
+        for (Map<String, Object> ballot : ballotsList) {
+            String candidateId = ((String) ballot.get("candidate_id")).toLowerCase();
+            if (tallies.containsKey(candidateId)) {
+                tallies.put(candidateId, tallies.get(candidateId) + 1);
+                totalVotes++;
             }
         }
 
@@ -361,7 +488,6 @@ public class VotingService {
 
         String verificationGuide = generateVerificationGuideMarkdown(currentMeta, tallies, totalVotes, auditPackage);
 
-        // Create results payload
         VotingResultsResponse resultsResponse = new VotingResultsResponse(
                 "COMPLETED",
                 (String) currentMeta.get("title"),
@@ -372,41 +498,41 @@ public class VotingService {
                 verificationGuide
         );
 
-        // Write results.json file to Backblaze B2 (falling back to local storage if disabled or fails)
-        boolean uploadedToB2 = false;
         byte[] resultsBytes = objectMapper.writeValueAsBytes(resultsResponse);
 
-        if ("b2".equalsIgnoreCase(storageType) && s3Client != null) {
-            try {
-                log.info("Uploading finalized results to Backblaze B2 bucket '{}' key '{}/results.json'", bucketName, voteId);
-                s3Client.putObject(PutObjectRequest.builder()
-                        .bucket(bucketName)
-                        .key(voteId + "/results.json")
-                        .contentType("application/json")
-                        .build(),
-                        RequestBody.fromBytes(resultsBytes));
-                uploadedToB2 = true;
-                log.info("Successfully uploaded results to Backblaze B2!");
-            } catch (Exception e) {
-                log.error("Failed to upload finalized results to Backblaze B2 (falling back to local storage)", e);
+        if (isB2()) {
+            log.info("Uploading finalized results to Backblaze B2 bucket '{}' key '{}/results.json'", bucketName, voteId);
+            b2Put(voteId + "/results.json", resultsBytes, "application/json");
+            log.info("Successfully uploaded results to Backblaze B2!");
+
+            // Update metadata status in B2
+            Map<String, Object> updatedMeta = new HashMap<>(currentMeta);
+            updatedMeta.put("status", "COMPLETED");
+            b2PutJson(voteId + "/metadata.json", updatedMeta);
+
+            // Delete individual ballot and nullifier objects from B2 (ephemeral by design)
+            for (String key : b2List(voteId + "/ballots/")) {
+                try { s3Client.deleteObject(DeleteObjectRequest.builder().bucket(bucketName).key(key).build()); }
+                catch (Exception e) { log.warn("Failed to delete B2 ballot object: {}", key, e); }
             }
-        }
-
-        if (!uploadedToB2) {
-            log.info("Writing finalized results to local storage fallback for voteId: {}", voteId);
+            for (String key : b2List(voteId + "/nullifiers/")) {
+                try { s3Client.deleteObject(DeleteObjectRequest.builder().bucket(bucketName).key(key).build()); }
+                catch (Exception e) { log.warn("Failed to delete B2 nullifier object: {}", key, e); }
+            }
+        } else {
+            Path sessionDir = storageRoot.resolve(voteId);
+            log.info("Writing finalized results to local storage for voteId: {}", voteId);
             Files.write(sessionDir.resolve("results.json"), resultsBytes);
+
+            Map<String, Object> updatedMeta = new HashMap<>(currentMeta);
+            updatedMeta.put("status", "COMPLETED");
+            Files.writeString(sessionDir.resolve("metadata.json"), objectMapper.writeValueAsString(updatedMeta));
+
+            deleteDirectory(sessionDir.resolve("ballots").toFile());
+            deleteDirectory(sessionDir.resolve("nullifiers").toFile());
         }
 
-        // Update metadata status
-        Map<String, Object> updatedMeta = new HashMap<>(currentMeta);
-        updatedMeta.put("status", "COMPLETED");
-        Files.writeString(sessionDir.resolve("metadata.json"), objectMapper.writeValueAsString(updatedMeta));
-
-        // Purge individual ballots and nullifiers folders (Ephemeral Storage savings)
-        deleteDirectory(sessionDir.resolve("ballots").toFile());
-        deleteDirectory(sessionDir.resolve("nullifiers").toFile());
-
-        // Deliver results if delivery target exists
+        // Deliver results via configured delivery channels
         String deliveryTarget = (String) currentMeta.getOrDefault("delivery_target", "");
         if (deliveryTarget != null && !deliveryTarget.isBlank()) {
             for (VotingResultDeliveryService service : deliveryServices) {
@@ -421,29 +547,59 @@ public class VotingService {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Background expiry scanner
+    // -----------------------------------------------------------------------
+
     @Scheduled(fixedRate = 15000) // Run every 15 seconds to detect expired sessions
     public void scanAndFinalizeExpiredSessions() {
-        File[] sessionDirs = storageRoot.toFile().listFiles(File::isDirectory);
-        if (sessionDirs == null) return;
-
-        for (File dir : sessionDirs) {
-            Path metadataPath = dir.toPath().resolve("metadata.json");
-            if (Files.exists(metadataPath)) {
+        if (isB2()) {
+            // Scan all metadata.json objects in the B2 bucket
+            List<String> metadataKeys = b2List(""); // list all objects
+            for (String key : metadataKeys) {
+                if (!key.endsWith("/metadata.json")) continue;
+                String voteId = key.substring(0, key.indexOf("/metadata.json"));
                 try {
-                    Map<String, Object> meta = objectMapper.readValue(metadataPath.toFile(), Map.class);
+                    Map<String, Object> meta = b2GetJson(key).orElse(null);
+                    if (meta == null) continue;
                     String status = (String) meta.getOrDefault("status", "ACTIVE");
                     if ("ACTIVE".equalsIgnoreCase(status)) {
                         Instant expiresAt = Instant.parse((String) meta.get("expires_at"));
                         if (Instant.now().isAfter(expiresAt)) {
-                            finalizeSession(dir.getName(), meta);
+                            finalizeSession(voteId, meta);
                         }
                     }
                 } catch (Exception e) {
-                    log.error("Error processing auto-finalization for session: {}", dir.getName(), e);
+                    log.error("Error processing auto-finalization for B2 session: {}", voteId, e);
+                }
+            }
+        } else {
+            File[] sessionDirs = storageRoot.toFile().listFiles(File::isDirectory);
+            if (sessionDirs == null) return;
+
+            for (File dir : sessionDirs) {
+                Path metadataPath = dir.toPath().resolve("metadata.json");
+                if (Files.exists(metadataPath)) {
+                    try {
+                        Map<String, Object> meta = objectMapper.readValue(metadataPath.toFile(), Map.class);
+                        String status = (String) meta.getOrDefault("status", "ACTIVE");
+                        if ("ACTIVE".equalsIgnoreCase(status)) {
+                            Instant expiresAt = Instant.parse((String) meta.get("expires_at"));
+                            if (Instant.now().isAfter(expiresAt)) {
+                                finalizeSession(dir.getName(), meta);
+                            }
+                        }
+                    } catch (Exception e) {
+                        log.error("Error processing auto-finalization for session: {}", dir.getName(), e);
+                    }
                 }
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
 
     private void deleteDirectory(File directoryToBeDeleted) {
         File[] allContents = directoryToBeDeleted.listFiles();
@@ -455,12 +611,13 @@ public class VotingService {
         directoryToBeDeleted.delete();
     }
 
-    private String generateVerificationGuideMarkdown(Map<String, Object> metadata, Map<String, Integer> tallies, int totalVotes, Map<String, Object> auditPackage) {
+    private String generateVerificationGuideMarkdown(Map<String, Object> metadata, Map<String, Integer> tallies,
+                                                      int totalVotes, Map<String, Object> auditPackage) {
         StringBuilder sb = new StringBuilder();
         sb.append("# Cryptographic Election Audit Report\n\n");
         sb.append("This report contains the raw mathematical proofs and audit trail for the election: **").append(metadata.get("title")).append("**.\n");
         sb.append("To maximize public trust, this election has been executed using a Zero-Knowledge Proof (ZKP) verification scheme over NIST P-256 (secp256r1).\n\n");
-        
+
         sb.append("## Election Summary\n");
         sb.append("*   **Vote Session ID:** `").append(metadata.get("vote_id")).append("`\n");
         sb.append("*   **Expires At:** `").append(metadata.get("expires_at")).append("`\n");
@@ -476,7 +633,7 @@ public class VotingService {
 
         sb.append("## How to Verify the Integrity of This Election\n");
         sb.append("The integrity of this voting session rests on three mathematical layers. Any citizen or auditor can execute verification scripts using the raw JSON audit package supplied alongside this guide:\n\n");
-        
+
         sb.append("### 1. Verification of Voter Eligibility and One-Vote Constraint\n");
         sb.append("We verify that the number of ballots matches the list of unique voter nullifiers. If a nullifier is reused, it is blocked at the storage layer. \n");
         sb.append("- Check that the count of unique hashes in `audit_package.nullifiers` equals `audit_package.ballots` length.\n");
@@ -491,7 +648,7 @@ public class VotingService {
         sb.append("- $R = (\\text{commitment\\_x}, \\text{commitment\\_y})$ is reconstructed using the commitment hash.\n");
         sb.append("- $c$ is the scalar challenge sent by the server.\n");
         sb.append("- $s$ is the scalar response of the prover.\n\n");
-        
+
         sb.append("### 3. Anonymity Verification (No-Link Audit)\n");
         sb.append("Because the `nullifiers` are registered in an isolated directory and the `ballots` are stored as randomized JSON objects with no metadata linking them back to the nullifier, there is zero correlation between a voter's public identifier and their actual candidate selection. An auditor can verify that the list of ballots contains no matching timestamps, indexing, or transaction logs that link them to specific nullifiers.");
 
