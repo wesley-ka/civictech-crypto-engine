@@ -25,7 +25,7 @@ crypto:
   # API key for authenticating requests. Sent as Authorization: Bearer <key>.
   # Generate a strong key with: openssl rand -hex 32
   # Set via CRYPTO_API_KEY environment variable in production.
-  api-key: ""
+  api-key: ${CRYPTO_API_KEY:dev-api-key-sample}
 
 logging:
   level:
