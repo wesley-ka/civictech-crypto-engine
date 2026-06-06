@@ -162,13 +162,13 @@ The Zero-Knowledge Age Verifier implements a non-interactive variant of the **Sc
    The prover generates a random ephemeral nonce $k \in [1, n-1]$ and computes a commitment point on the curve:
    $$R = k \cdot G$$
    The prover computes the SHA-256 hash of the compressed commitment point $R$ to bind it:
-   $$\text{commitment\_hash} = \text{SHA-256}(R)$$
+   $$\text{commitment hash} = \text{SHA-256}(R)$$
 4. **Challenge (Second Step)**:
    The verifier issues a random scalar challenge $c \in [1, n-1]$. (In a non-interactive setup, this challenge is computed via the Fiat-Shamir heuristic, but in our API, the challenge is passed explicitly to support interactive protocols).
 5. **Response (Third Step)**:
    The prover calculates the response scalar:
    $$s = k + c \cdot x \pmod n$$
-   The proof bundle consisting of $(R, c, s, Y, \text{commitment\_hash})$ is sent to the verifier.
+   The proof bundle consisting of $(R, c, s, Y, \text{commitment hash})$ is sent to the verifier.
 6. **Verification**:
    The verifier receives the proof and performs the following verification:
    * Re-computes the SHA-256 hash of the compressed point $R$ and checks if it matches the received `commitment_hash`.
