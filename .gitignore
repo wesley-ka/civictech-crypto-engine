@@ -32,4 +32,4 @@ logs/
 
 ### Local Secrets & Testing ###
 src/main/resources/application-local.properties
-voting-storage/
+local-storage/

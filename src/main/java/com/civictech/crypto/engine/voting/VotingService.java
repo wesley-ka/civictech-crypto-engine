@@ -65,7 +65,7 @@ public class VotingService {
 
         // Local filesystem storage is only used when storageType=local.
         // When storageType=b2, all state lives in Backblaze B2 — no local disk needed.
-        this.storageRoot = Paths.get("./voting-storage");
+        this.storageRoot = Paths.get("./local-storage/voting");
         if (!isB2()) {
             try {
                 Files.createDirectories(storageRoot);
@@ -166,7 +166,7 @@ public class VotingService {
 
         if (isB2()) {
             // All session state lives in B2 — no local disk required
-            b2PutJson(voteId + "/metadata.json", metadata);
+            b2PutJson("voting/" + voteId + "/metadata.json", metadata);
             log.info("Created voting session in B2: {}", voteId);
         } else {
             try {
@@ -186,7 +186,7 @@ public class VotingService {
         Map<String, Object> meta;
 
         if (isB2()) {
-            meta = b2GetJson(voteId + "/metadata.json")
+            meta = b2GetJson("voting/" + voteId + "/metadata.json")
                     .orElseThrow(() -> new IllegalArgumentException("Voting session not found."));
         } else {
             Path metadataPath = storageRoot.resolve(voteId).resolve("metadata.json");
@@ -226,7 +226,7 @@ public class VotingService {
         // 2. Check if nullifier has already voted (double vote prevention)
         boolean nullifierUsed;
         if (isB2()) {
-            nullifierUsed = b2Exists(voteId + "/nullifiers/" + nullifier);
+            nullifierUsed = b2Exists("voting/" + voteId + "/nullifiers/" + nullifier);
         } else {
             nullifierUsed = Files.exists(storageRoot.resolve(voteId).resolve("nullifiers").resolve(nullifier));
         }
@@ -309,10 +309,10 @@ public class VotingService {
 
         // 4. Double Vote Prevention: write nullifier marker atomically
         if (isB2()) {
-            if (b2Exists(voteId + "/nullifiers/" + nullifier)) {
+            if (b2Exists("voting/" + voteId + "/nullifiers/" + nullifier)) {
                 throw new IllegalArgumentException("Double voting detected. Nullifier already used.");
             }
-            b2Put(voteId + "/nullifiers/" + nullifier, new byte[0], "application/octet-stream");
+            b2Put("voting/" + voteId + "/nullifiers/" + nullifier, new byte[0], "application/octet-stream");
         } else {
             Path nullifierPath = storageRoot.resolve(voteId).resolve("nullifiers").resolve(nullifier);
             try {
@@ -334,7 +334,7 @@ public class VotingService {
         );
 
         if (isB2()) {
-            b2PutJson(voteId + "/ballots/" + ballotId + ".json", ballotData);
+            b2PutJson("voting/" + voteId + "/ballots/" + ballotId + ".json", ballotData);
         } else {
             Path ballotPath = storageRoot.resolve(voteId).resolve("ballots").resolve(ballotId + ".json");
             try {
@@ -356,7 +356,7 @@ public class VotingService {
                                 int requestServerPort, String contextPath) {
         Map<String, Object> meta;
         if (isB2()) {
-            meta = b2GetJson(voteId + "/metadata.json")
+            meta = b2GetJson("voting/" + voteId + "/metadata.json")
                     .orElseThrow(() -> new IllegalArgumentException("Voting session not found."));
         } else {
             Path metadataPath = storageRoot.resolve(voteId).resolve("metadata.json");
@@ -387,7 +387,7 @@ public class VotingService {
         // Return B2 CDN URL if configured, otherwise fallback to local static endpoint
         String cdnUrl = System.getenv("B2_CDN_URL");
         if (cdnUrl != null && !cdnUrl.isBlank()) {
-            return cdnUrl.trim() + "/" + voteId + "/results.json";
+            return cdnUrl.trim() + "/voting/" + voteId + "/results.json";
         }
 
         return contextPath + "/v1/voting/static/" + voteId + "/results.json";
@@ -395,7 +395,7 @@ public class VotingService {
 
     public byte[] getStaticResultsFile(String voteId) {
         if (isB2()) {
-            return b2Get(voteId + "/results.json")
+            return b2Get("voting/" + voteId + "/results.json")
                     .orElseThrow(() -> new IllegalArgumentException("Finalized results not found."));
         }
 
@@ -418,7 +418,7 @@ public class VotingService {
         // Re-read metadata to prevent double-finalization
         Map<String, Object> currentMeta;
         if (isB2()) {
-            currentMeta = b2GetJson(voteId + "/metadata.json")
+            currentMeta = b2GetJson("voting/" + voteId + "/metadata.json")
                     .orElseThrow(() -> new IllegalArgumentException("Voting session not found during finalization."));
         } else {
             Path sessionDir = storageRoot.resolve(voteId);
@@ -434,8 +434,8 @@ public class VotingService {
         // Collect nullifiers
         List<String> nullifiersList = new ArrayList<>();
         if (isB2()) {
-            for (String key : b2List(voteId + "/nullifiers/")) {
-                nullifiersList.add(key.substring((voteId + "/nullifiers/").length()));
+            for (String key : b2List("voting/" + voteId + "/nullifiers/")) {
+                nullifiersList.add(key.substring(("voting/" + voteId + "/nullifiers/").length()));
             }
         } else {
             File[] nullifierFiles = storageRoot.resolve(voteId).resolve("nullifiers").toFile().listFiles();
@@ -454,7 +454,7 @@ public class VotingService {
 
         int totalVotes = 0;
         if (isB2()) {
-            for (String key : b2List(voteId + "/ballots/")) {
+            for (String key : b2List("voting/" + voteId + "/ballots/")) {
                 b2Get(key).ifPresent(bytes -> {
                     try {
                         ballotsList.add(objectMapper.readValue(bytes, Map.class));
@@ -501,21 +501,21 @@ public class VotingService {
         byte[] resultsBytes = objectMapper.writeValueAsBytes(resultsResponse);
 
         if (isB2()) {
-            log.info("Uploading finalized results to Backblaze B2 bucket '{}' key '{}/results.json'", bucketName, voteId);
-            b2Put(voteId + "/results.json", resultsBytes, "application/json");
+            log.info("Uploading finalized results to Backblaze B2 bucket '{}' key 'voting/{}/results.json'", bucketName, voteId);
+            b2Put("voting/" + voteId + "/results.json", resultsBytes, "application/json");
             log.info("Successfully uploaded results to Backblaze B2!");
 
             // Update metadata status in B2
             Map<String, Object> updatedMeta = new HashMap<>(currentMeta);
             updatedMeta.put("status", "COMPLETED");
-            b2PutJson(voteId + "/metadata.json", updatedMeta);
+            b2PutJson("voting/" + voteId + "/metadata.json", updatedMeta);
 
             // Delete individual ballot and nullifier objects from B2 (ephemeral by design)
-            for (String key : b2List(voteId + "/ballots/")) {
+            for (String key : b2List("voting/" + voteId + "/ballots/")) {
                 try { s3Client.deleteObject(DeleteObjectRequest.builder().bucket(bucketName).key(key).build()); }
                 catch (Exception e) { log.warn("Failed to delete B2 ballot object: {}", key, e); }
             }
-            for (String key : b2List(voteId + "/nullifiers/")) {
+            for (String key : b2List("voting/" + voteId + "/nullifiers/")) {
                 try { s3Client.deleteObject(DeleteObjectRequest.builder().bucket(bucketName).key(key).build()); }
                 catch (Exception e) { log.warn("Failed to delete B2 nullifier object: {}", key, e); }
             }
@@ -554,11 +554,11 @@ public class VotingService {
     @Scheduled(fixedRate = 15000) // Run every 15 seconds to detect expired sessions
     public void scanAndFinalizeExpiredSessions() {
         if (isB2()) {
-            // Scan all metadata.json objects in the B2 bucket
-            List<String> metadataKeys = b2List(""); // list all objects
+            // Scan all metadata.json objects in the B2 bucket under the voting prefix
+            List<String> metadataKeys = b2List("voting/");
             for (String key : metadataKeys) {
                 if (!key.endsWith("/metadata.json")) continue;
-                String voteId = key.substring(0, key.indexOf("/metadata.json"));
+                String voteId = key.substring("voting/".length(), key.indexOf("/metadata.json"));
                 try {
                     Map<String, Object> meta = b2GetJson(key).orElse(null);
                     if (meta == null) continue;
@@ -596,6 +596,7 @@ public class VotingService {
             }
         }
     }
+
 
     // -----------------------------------------------------------------------
     // Helpers

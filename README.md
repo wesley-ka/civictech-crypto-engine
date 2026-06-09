@@ -30,6 +30,8 @@ civictech-crypto-engine/
     │   │                   │   ├── CertificateController.java
     │   │                   │   ├── CertificateService.java
     │   │                   │   └── dto/
+    │   │                   ├── cleanup
+    │   │                   │   └── StorageCleanupService.java
     │   │                   ├── config
     │   │                   │   ├── BouncyCastleConfig.java
     │   │                   │   ├── CryptographicKeysConfig.java
@@ -44,6 +46,14 @@ civictech-crypto-engine/
     │   │                   ├── identity
     │   │                   │   ├── ZkpController.java
     │   │                   │   ├── ZkpService.java
+    │   │                   │   ├── vc
+    │   │                   │   │   ├── VcController.java
+    │   │                   │   │   ├── VcService.java
+    │   │                   │   │   └── dto/
+    │   │                   │   └── dto/
+    │   │                   ├── ledger
+    │   │                   │   ├── LedgerController.java
+    │   │                   │   ├── LedgerService.java
     │   │                   │   └── dto/
     │   │                   ├── security
     │   │                   │   ├── ApiKeyAuthFilter.java
@@ -219,6 +229,29 @@ This module provides a database-free, highly scalable, and privacy-preserving el
 4. **Voter Anonymity (No-Link at Rest)**: The backend decouples voter identities (nullifiers) from their candidate selections by storing them in separate directories (`nullifiers/` and `ballots/`). Since ballots are written as randomized JSON objects with no timestamps or metadata linked back to the nullifiers, there is no cryptographic or physical linkage between the voter's identity and their selection.
 5. **Double-Voting Prevention (No Database)**: To remain fully stateless and database-free, the engine writes nullifiers atomically to the local file system (simulating S3 conditional writes like `If-None-Match: *`). If a voter tries to vote twice, the second file write fails, and the ballot is rejected.
 6. **Automatic Purging & Delivery**: Every 15 seconds, a scheduler checks for expired sessions. Upon expiration, it compiles the results, generates a **Unified JSON Audit Package** and a **Markdown Verification Guide**, uploads them to B2 Object Storage (or local storage), delivers the results directly to the creator's Telegram chat, and purges all voter-identifying nullifiers and ballot files, achieving zero persistent storage costs.
+
+### 3.7 W3C-like Verifiable Credentials (VC) with Two-Device Flow
+* **W3C Standard Alignment**:
+  Verifiable Credentials (VC) provide a digitally signed cryptographic identity statement. The JSON structure conforms to the W3C Verifiable Credentials Data Model, containing a `@context`, `id` (as a URN UUID), standard types, issuer identity (`did:web:engine.civictech.org`), issuance date, expiration date, and a custom ECDSA-signed `proof` block.
+* **Deterministic Hashing & Canonicalization**:
+  To sign the VC securely, the engine extracts the credential data (excluding the signature proof block), marshals it into a sorted, deterministic JSON payload, and computes a SHA-256 hash. The hash is then signed using the engine's private ECDSA key.
+* **Ephemeral Two-Device Mobile Verification Flow**:
+  To support scanning a VC on desktop using a mobile phone without database storage:
+  1. Desktop app calls `POST /api/v1/identity/vc/issue` to generate the VC. The signed VC JSON is written to ephemeral storage (such as Backblaze B2 under key `vc/{vcId}.json` or local `./local-storage/vc/{vcId}.json`).
+  2. The endpoint returns the signed VC payload alongside a `shareUrl` (pointing to a shared read endpoint `/v1/identity/vc/share/{vcId}`).
+  3. Desktop app displays a QR code containing a URL to a verification portal containing the `vcUrl` parameter.
+  4. The user scans the QR code with their mobile phone. The mobile browser fetches the raw VC payload from `vcUrl` and calls the engine's `/api/v1/identity/vc/verify` endpoint to mathematically audit the signature.
+
+### 3.8 Cryptographic Provenance Ledger with Chain Verification
+* **Blockchain-like Transit Log**:
+  Provides an immutable supply-chain or chain-of-custody audit trail for physical civic assets. Each event is recorded as a block linked to its predecessor.
+* **Block Chaining**:
+  Every block contains the hash of the preceding block (`previousBlockHash`). The hash of the block itself is calculated using:
+  $$\text{BlockHash}_i = \text{SHA-256}(i \mathbin{\Vert} \text{Timestamp}_i \mathbin{\Vert} \text{AssetId}_i \mathbin{\Vert} \text{EventType}_i \mathbin{\Vert} \text{Custodian}_i \mathbin{\Vert} \text{Location}_i \mathbin{\Vert} \text{BlockHash}_{i-1} \mathbin{\Vert} \text{Meta}_i)$$
+* **ECDSA Signature Integrity**:
+  The computed block hash is signed by the engine using the configured ECDSA private key. Any modification to the data of any block (e.g. location or custodian) breaks the parent hash linkage and fails signature verification on all subsequent blocks, providing tamper evidence.
+* **File/Cloud-backed Database-free Storage**:
+  Blocks are written sequentially as individual JSON files in local disk (`./local-storage/ledger/{assetId}/block_{index}.json`) or Backblaze B2 prefixes (`ledger/{assetId}/block_{index}.json`). Chain audits parse the sequence to ensure order, linkage, and signature validity.
 
 ---
 
@@ -546,6 +579,245 @@ curl -i -L -H "Authorization: Bearer YOUR_API_KEY" \
 ```
 * **Expected Response (Redirect followed)**:
 Returns the final archived results JSON file containing the audit package, tallies, and verification guide.
+
+---
+
+### Module 7: Verifiable Credentials (VC) Wallet
+
+#### 1. Issue Verifiable Credential
+* **Endpoint**: `POST /api/v1/identity/vc/issue`
+* **Description**: Generates and signs a W3C-like Verifiable Credential (VC) JSON object using the server's private key.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/identity/vc/issue \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "subjectId": "did:example:citizen123",
+    "fullName": "Juana de Arco",
+    "attributes": {
+      "eligibleToVote": true,
+      "jurisdiction": "Madrid"
+    },
+    "expirationDays": 30
+  }'
+```
+* **Expected Response**:
+```json
+{
+  "vcId": "8f2a17cb-de34-45b7-a3cf-b567b2d5a329",
+  "shareUrl": "/v1/identity/vc/share/8f2a17cb-de34-45b7-a3cf-b567b2d5a329",
+  "credential": {
+    "@context": ["https://www.w3.org/2018/credentials/v1", "https://schema.org"],
+    "id": "urn:uuid:8f2a17cb-de34-45b7-a3cf-b567b2d5a329",
+    "type": ["VerifiableCredential", "CivicCitizenCredential"],
+    "issuer": "did:web:engine.civictech.org",
+    "issuanceDate": "2026-06-09T18:00:00Z",
+    "expirationDate": "2026-07-09T18:00:00Z",
+    "credentialSubject": {
+      "id": "did:example:citizen123",
+      "fullName": "Juana de Arco",
+      "eligibleToVote": true,
+      "jurisdiction": "Madrid"
+    },
+    "proof": {
+      "type": "JsonWebSignature2020",
+      "created": "2026-06-09T18:00:00Z",
+      "proofPurpose": "assertionMethod",
+      "verificationMethod": "did:web:engine.civictech.org#key-1",
+      "publicKeyX": "7c98f828...",
+      "publicKeyY": "8f89e2c2...",
+      "proofValue": "MEQCIDU4M12..."
+    }
+  }
+}
+```
+
+#### 2. Get Shared Credential (QR Scan Endpoint)
+* **Endpoint**: `GET /api/v1/identity/vc/share/{vcId}`
+* **Description**: Returns the raw signed verifiable credential JSON stored in B2 or local disk.
+* **Request**:
+```bash
+curl -X GET http://localhost:8080/api/v1/identity/vc/share/8f2a17cb-de34-45b7-a3cf-b567b2d5a329 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+* **Expected Response**: Returns the raw `VerifiableCredential` JSON object containing the signature proof block.
+
+#### 3. Verify Verifiable Credential
+* **Endpoint**: `POST /api/v1/identity/vc/verify`
+* **Description**: Mathematically checks the ECDSA signature, expiration, and payload integrity of a verifiable credential.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/identity/vc/verify \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "@context": ["https://www.w3.org/2018/credentials/v1", "https://schema.org"],
+    "id": "urn:uuid:8f2a17cb-de34-45b7-a3cf-b567b2d5a329",
+    "type": ["VerifiableCredential", "CivicCitizenCredential"],
+    "issuer": "did:web:engine.civictech.org",
+    "issuanceDate": "2026-06-09T18:00:00Z",
+    "expirationDate": "2026-07-09T18:00:00Z",
+    "credentialSubject": {
+      "id": "did:example:citizen123",
+      "fullName": "Juana de Arco",
+      "eligibleToVote": true,
+      "jurisdiction": "Madrid"
+    },
+    "proof": {
+      "type": "JsonWebSignature2020",
+      "created": "2026-06-09T18:00:00Z",
+      "proofPurpose": "assertionMethod",
+      "verificationMethod": "did:web:engine.civictech.org#key-1",
+      "publicKeyX": "7c98f828...",
+      "publicKeyY": "8f89e2c2...",
+      "proofValue": "MEQCIDU4M12..."
+    }
+  }'
+```
+* **Expected Response**:
+```json
+{
+  "verified": true,
+  "checks": {
+    "signatureValid": true,
+    "notExpired": true,
+    "integrityIntact": true
+  },
+  "issuer": "did:web:engine.civictech.org",
+  "subject": "did:example:citizen123",
+  "verifiedAt": "2026-06-09T18:02:00Z"
+}
+```
+
+---
+
+### Module 8: Cryptographic Provenance Ledger
+
+#### 1. Initialize Asset Ledger (Genesis Block)
+* **Endpoint**: `POST /api/v1/ledger/create`
+* **Description**: Starts an asset provenance history by writing block 0 (Genesis block) signed with ECDSA.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/ledger/create \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assetId": "VM-9872",
+    "assetType": "VOTING_MACHINE",
+    "custodian": "Central Election Office",
+    "meta": {
+      "manufacturer": "Indra Systems"
+    }
+  }'
+```
+* **Expected Response**:
+```json
+{
+  "index": 0,
+  "timestamp": "2026-06-09T18:00:00Z",
+  "assetId": "VM-9872",
+  "eventType": "GENESIS",
+  "custodian": "Central Election Office",
+  "previousBlockHash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "blockHash": "4a7f3e1b...",
+  "signature": "MEQCIE...",
+  "meta": {
+    "manufacturer": "Indra Systems"
+  }
+}
+```
+
+#### 2. Append Custody / Event Block
+* **Endpoint**: `POST /api/v1/ledger/append`
+* **Description**: Validates that `previousBlockHash` matches the current latest block, constructs and signs a new event block, and appends it to the chain.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/ledger/append \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "assetId": "VM-9872",
+    "eventType": "CUSTODY_TRANSFER",
+    "custodian": "Carrier Alpha",
+    "location": "Warehouse Madrid-South",
+    "previousBlockHash": "4a7f3e1b...",
+    "meta": {
+      "transportMode": "Truck-4"
+    }
+  }'
+```
+* **Expected Response**: Returns the appended block JSON with the computed hash and ECDSA signature.
+
+#### 3. Fetch Asset History
+* **Endpoint**: `GET /api/v1/ledger/{assetId}/history`
+* **Description**: Returns all sequential ledger blocks sorted by index.
+* **Request**:
+```bash
+curl -X GET http://localhost:8080/api/v1/ledger/VM-9872/history \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+
+#### 4. Audit Chain Verification
+* **Endpoint**: `GET /api/v1/ledger/{assetId}/verify`
+* **Description**: Audits the entire blockchain history for an asset, validating hash linkages and recalculating ECDSA signatures.
+* **Request**:
+```bash
+curl -X GET http://localhost:8080/api/v1/ledger/VM-9872/verify \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+* **Expected Response**:
+```json
+{
+  "assetId": "VM-9872",
+  "validChain": true,
+  "blockCount": 2,
+  "auditReport": [
+    {
+      "index": 0,
+      "hashMatches": true,
+      "signatureValid": true,
+      "blockHash": "4a7f3e1b..."
+    },
+    {
+      "index": 1,
+      "hashMatches": true,
+      "signatureValid": true,
+      "blockHash": "9b12e4f0..."
+    }
+  ]
+}
+```
+
+#### 5. Reset Ledger Demo
+* **Endpoint**: `DELETE /api/v1/ledger/{assetId}`
+* **Description**: Completely deletes/purges the asset's transaction blocks from storage.
+* **Request**:
+```bash
+curl -i -X DELETE http://localhost:8080/api/v1/ledger/VM-9872 \
+  -H "Authorization: Bearer YOUR_API_KEY"
+```
+* **Expected Response**: `204 No Content`
+
+#### 6. Database Tampering Simulator
+* **Endpoint**: `POST /api/v1/ledger/{assetId}/tamper`
+* **Description**: Bypasses signing logic to write a modified/tampered block to the database (modifying fields like `location` or `custodian` but leaving the original signature and hash untouched). Used to showcase audit verification catching unauthorized edits.
+* **Request**:
+```bash
+curl -X POST http://localhost:8080/api/v1/ledger/VM-9872/tamper \
+  -H "Authorization: Bearer YOUR_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "index": 1,
+    "location": "Unknown Warehouse"
+  }'
+```
+
+---
+
+### Module 9: Automated Storage Cleanup Service
+* **Trigger**: Scheduled daily at 3:00 AM.
+* **Description**: Scans the subfolders `voting/`, `ledger/`, and `vc/` (both on the local filesystem `./local-storage` and Backblaze B2 bucket prefixes) and purges all groups of objects or files whose files are older than 7 days, minimizing external storage overhead.
 
 ---
 

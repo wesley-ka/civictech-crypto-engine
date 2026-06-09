@@ -8,10 +8,17 @@ import com.civictech.crypto.engine.identity.dto.ZkpVerifyRequest;
 import com.civictech.crypto.engine.identity.dto.ZkpVerifyResponse;
 import com.civictech.crypto.engine.voting.VotingService;
 import com.civictech.crypto.engine.voting.dto.*;
+import com.civictech.crypto.engine.identity.vc.VcService;
+import com.civictech.crypto.engine.identity.vc.dto.*;
+import com.civictech.crypto.engine.ledger.LedgerService;
+import com.civictech.crypto.engine.ledger.dto.*;
+import com.civictech.crypto.engine.cleanup.StorageCleanupService;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.time.Instant;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import com.civictech.crypto.engine.signing.SigningService;
 import com.civictech.crypto.engine.signing.dto.SignRequest;
 import com.civictech.crypto.engine.signing.dto.SignResponse;
@@ -37,7 +44,18 @@ import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
 import org.bouncycastle.util.encoders.Hex;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
+import org.springframework.test.web.servlet.MockMvc;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.core.ResponseBytes;
+import software.amazon.awssdk.core.sync.RequestBody;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectResponse;
+import software.amazon.awssdk.services.s3.model.PutObjectRequest;
 
 
 import java.math.BigInteger;
@@ -54,7 +72,11 @@ import java.util.List;
 import static org.junit.jupiter.api.Assertions.*;
 
 @SpringBootTest
+@AutoConfigureMockMvc
 class CivicTechCryptoEngineApplicationTests {
+
+    @Autowired
+    private MockMvc mockMvc;
 
     @Autowired
     private SigningService signingService;
@@ -75,7 +97,25 @@ class CivicTechCryptoEngineApplicationTests {
     private VotingService votingService;
 
     @Autowired
+    private VcService vcService;
+
+    @Autowired
+    private LedgerService ledgerService;
+
+    @Autowired
+    private StorageCleanupService storageCleanupService;
+
+    @Autowired
     private com.fasterxml.jackson.databind.ObjectMapper objectMapper;
+
+    @Autowired(required = false)
+    private S3Client s3Client;
+
+    @Value("${voting.storage.type:local}")
+    private String storageType;
+
+    @Value("${voting.storage.b2.bucket-name:}")
+    private String bucketName;
 
 
     @Test
@@ -316,12 +356,23 @@ class CivicTechCryptoEngineApplicationTests {
         assertThrows(IllegalArgumentException.class, () -> votingService.castVote(castReq));
 
         // 9. Manually expire the session by modifying metadata.json
-        Path metadataPath = Paths.get("./voting-storage").resolve(voteId).resolve("metadata.json");
-        Map<String, Object> metadataMap = objectMapper.readValue(metadataPath.toFile(), Map.class);
-        
-        // Put expires_at in the past
-        metadataMap.put("expires_at", Instant.now().minusSeconds(10).toString());
-        Files.writeString(metadataPath, objectMapper.writeValueAsString(metadataMap));
+        Map<String, Object> metadataMap;
+        boolean isB2Storage = "b2".equalsIgnoreCase(storageType) && s3Client != null;
+        if (isB2Storage) {
+            String s3Key = "voting/" + voteId + "/metadata.json";
+            ResponseBytes<GetObjectResponse> obj = s3Client.getObjectAsBytes(
+                GetObjectRequest.builder().bucket(bucketName).key(s3Key).build());
+            metadataMap = objectMapper.readValue(obj.asByteArray(), Map.class);
+            metadataMap.put("expires_at", Instant.now().minusSeconds(10).toString());
+            s3Client.putObject(PutObjectRequest.builder()
+                .bucket(bucketName).key(s3Key).contentType("application/json").build(),
+                RequestBody.fromBytes(objectMapper.writeValueAsBytes(metadataMap)));
+        } else {
+            Path metadataPath = Paths.get("./local-storage/voting").resolve(voteId).resolve("metadata.json");
+            metadataMap = objectMapper.readValue(metadataPath.toFile(), Map.class);
+            metadataMap.put("expires_at", Instant.now().minusSeconds(10).toString());
+            Files.writeString(metadataPath, objectMapper.writeValueAsString(metadataMap));
+        }
 
         // 10. Fetch results URL (this triggers finalization, deletion of subdirs and delivery)
         String redirectUrl = votingService.getResultsUrl(voteId, "http", "localhost", 8080, "/api");
@@ -340,10 +391,221 @@ class CivicTechCryptoEngineApplicationTests {
         assertFalse(results.verificationGuide().isEmpty());
 
         // Verify folders are purged
-        Path nullifiersDir = Paths.get("./voting-storage").resolve(voteId).resolve("nullifiers");
-        Path ballotsDir = Paths.get("./voting-storage").resolve(voteId).resolve("ballots");
+        Path nullifiersDir = Paths.get("./local-storage/voting").resolve(voteId).resolve("nullifiers");
+        Path ballotsDir = Paths.get("./local-storage/voting").resolve(voteId).resolve("ballots");
         assertFalse(Files.exists(nullifiersDir));
         assertFalse(Files.exists(ballotsDir));
+    }
+
+    @Test
+    void testModule7_VerifiableCredentials() throws Exception {
+        // 1. Issue VC
+        Map<String, Object> attributes = new HashMap<>();
+        attributes.put("eligibleToVote", true);
+        attributes.put("jurisdiction", "Madrid");
+        IssueVcRequest issueRequest = new IssueVcRequest("did:example:citizen123", "Juana de Arco", attributes, 10);
+        IssueVcResponse issueResponse = vcService.issueCredential(issueRequest);
+
+        assertNotNull(issueResponse.vcId());
+        assertNotNull(issueResponse.shareUrl());
+        assertNotNull(issueResponse.credential());
+        assertEquals("did:web:engine.civictech.org", issueResponse.credential().issuer());
+
+        // 2. Fetch shared VC
+        VerifiableCredential fetchedCred = vcService.getSharedCredential(issueResponse.vcId());
+        assertNotNull(fetchedCred);
+        assertEquals(issueResponse.credential().id(), fetchedCred.id());
+
+        // 3. Verify VC (Valid)
+        VerifyVcResponse verifyResponse = vcService.verifyCredential(fetchedCred);
+        assertTrue(verifyResponse.verified());
+        assertTrue(verifyResponse.checks().signatureValid());
+        assertTrue(verifyResponse.checks().notExpired());
+        assertTrue(verifyResponse.checks().integrityIntact());
+
+        // 4. Verify VC (Tampered)
+        // We modify a field in credentialSubject to simulate tampering
+        Map<String, Object> modifiedSubject = new HashMap<>(fetchedCred.credentialSubject());
+        modifiedSubject.put("fullName", "Malicious Actor");
+        VerifiableCredential tamperedCred = new VerifiableCredential(
+                fetchedCred.context(),
+                fetchedCred.id(),
+                fetchedCred.type(),
+                fetchedCred.issuer(),
+                fetchedCred.issuanceDate(),
+                fetchedCred.expirationDate(),
+                modifiedSubject,
+                fetchedCred.proof()
+        );
+
+        VerifyVcResponse verifyResponseTampered = vcService.verifyCredential(tamperedCred);
+        assertFalse(verifyResponseTampered.verified());
+        assertFalse(verifyResponseTampered.checks().signatureValid());
+        assertFalse(verifyResponseTampered.checks().integrityIntact());
+    }
+
+    @Test
+    void testModule8_CryptographicProvenanceLedger() throws Exception {
+        String assetId = "VM-TEST-" + System.currentTimeMillis();
+
+        // 1. Create Genesis Asset
+        Map<String, Object> genesisMeta = new HashMap<>();
+        genesisMeta.put("batch", "B-2026");
+        CreateAssetRequest createRequest = new CreateAssetRequest(assetId, "VOTING_MACHINE", "Central Election Office", genesisMeta);
+        LedgerBlock genesisBlock = ledgerService.createGenesisAsset(createRequest);
+
+        assertNotNull(genesisBlock);
+        assertEquals(0, genesisBlock.index());
+        assertEquals("GENESIS", genesisBlock.eventType());
+        assertEquals("0000000000000000000000000000000000000000000000000000000000000000", genesisBlock.previousBlockHash());
+        assertNotNull(genesisBlock.blockHash());
+        assertNotNull(genesisBlock.signature());
+
+        // 2. Append event
+        Map<String, Object> appendMeta = new HashMap<>();
+        appendMeta.put("carrier", "DHL");
+        AppendEventRequest appendRequest = new AppendEventRequest(
+                assetId,
+                "CUSTODY_TRANSFER",
+                "Carrier Alpha",
+                "Warehouse Madrid",
+                genesisBlock.blockHash(),
+                appendMeta
+        );
+        LedgerBlock nextBlock = ledgerService.appendEvent(appendRequest);
+
+        assertNotNull(nextBlock);
+        assertEquals(1, nextBlock.index());
+        assertEquals("CUSTODY_TRANSFER", nextBlock.eventType());
+        assertEquals(genesisBlock.blockHash(), nextBlock.previousBlockHash());
+
+        // 3. Verify mismatch rejected
+        AppendEventRequest invalidAppend = new AppendEventRequest(
+                assetId,
+                "CUSTODY_TRANSFER",
+                "Carrier Alpha",
+                "Warehouse Madrid",
+                "invalid-previous-hash-value-123",
+                appendMeta
+        );
+        assertThrows(IllegalArgumentException.class, () -> ledgerService.appendEvent(invalidAppend));
+
+        // 4. History check
+        LedgerHistoryResponse history = ledgerService.getAssetHistory(assetId);
+        assertEquals(2, history.totalBlocks());
+        assertEquals(0, history.blocks().get(0).index());
+        assertEquals(1, history.blocks().get(1).index());
+
+        // 5. Verification check (Valid)
+        LedgerVerificationResponse verifyResponse = ledgerService.verifyLedger(assetId);
+        assertTrue(verifyResponse.validChain());
+        assertEquals(2, verifyResponse.blockCount());
+        assertTrue(verifyResponse.auditReport().get(0).hashMatches());
+        assertTrue(verifyResponse.auditReport().get(0).signatureValid());
+        assertTrue(verifyResponse.auditReport().get(1).hashMatches());
+        assertTrue(verifyResponse.auditReport().get(1).signatureValid());
+
+        // 6. Tamper check (by writing tampered block file directly)
+        Path block0Path = Paths.get("./local-storage/ledger").resolve(assetId).resolve("block_0.json");
+        if (Files.exists(block0Path)) {
+            // Read, modify, and overwrite
+            Map<String, Object> blockMap = objectMapper.readValue(block0Path.toFile(), Map.class);
+            blockMap.put("custodian", "Hacker");
+            Files.writeString(block0Path, objectMapper.writeValueAsString(blockMap));
+
+            // Run verification again
+            LedgerVerificationResponse verifyResponseTampered = ledgerService.verifyLedger(assetId);
+            assertFalse(verifyResponseTampered.validChain());
+            // Either signature or hash verification (or linkage) must fail for index 0
+            assertFalse(verifyResponseTampered.auditReport().get(0).hashMatches() &&
+                        verifyResponseTampered.auditReport().get(0).signatureValid());
+        }
+
+        // 7. REST Controller endpoint mapping check via MockMvc
+        mockMvc.perform(get("/v1/ledger/" + assetId + "/latest")
+                .header("Authorization", "Bearer dev-api-key-sample"))
+                .andExpect(status().isOk());
+
+        // 8. Test Simulated Tampering REST API
+        String tamperPayload = "{\"index\":1,\"location\":\"Unknown Warehouse\"}";
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post("/v1/ledger/" + assetId + "/tamper")
+                .header("Authorization", "Bearer dev-api-key-sample")
+                .contentType(org.springframework.http.MediaType.APPLICATION_JSON)
+                .content(tamperPayload))
+                .andExpect(status().isOk());
+
+        // Verify it was tampered via API (validChain should now be false)
+        mockMvc.perform(get("/v1/ledger/" + assetId + "/verify")
+                .header("Authorization", "Bearer dev-api-key-sample"))
+                .andExpect(status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.validChain").value(false));
+
+        // 9. Test Reset Ledger REST API (DELETE)
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete("/v1/ledger/" + assetId)
+                .header("Authorization", "Bearer dev-api-key-sample"))
+                .andExpect(status().isNoContent());
+
+        // Verify history is empty now
+        mockMvc.perform(get("/v1/ledger/" + assetId + "/history")
+                .header("Authorization", "Bearer dev-api-key-sample"))
+                .andExpect(status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath("$.totalBlocks").value(0));
+    }
+
+    @Test
+    void testModule8_StorageCleanupService() throws Exception {
+        if (!"local".equalsIgnoreCase(storageType)) {
+            // Skip local file cleanup test if running against actual B2
+            return;
+        }
+
+        Path root = Paths.get("./local-storage");
+        Path votingExpired = root.resolve("voting/expired-session");
+        Path votingActive = root.resolve("voting/active-session");
+        Path ledgerExpired = root.resolve("ledger/expired-ledger");
+        Path vcExpired = root.resolve("vc/expired-vc.json");
+        Path vcActive = root.resolve("vc/active-vc.json");
+
+        // Create directories and files
+        Files.createDirectories(votingExpired);
+        Files.createDirectories(votingActive);
+        Files.createDirectories(ledgerExpired);
+        Files.createDirectories(root.resolve("vc"));
+
+        Path file1 = votingExpired.resolve("metadata.json");
+        Path file2 = votingActive.resolve("metadata.json");
+        Path file3 = ledgerExpired.resolve("block_0.json");
+
+        Files.writeString(file1, "expired");
+        Files.writeString(file2, "active");
+        Files.writeString(file3, "expired-ledger");
+        Files.writeString(vcExpired, "expired-vc");
+        Files.writeString(vcActive, "active-vc");
+
+        // Backdate the expired ones
+        long eightDaysAgo = Instant.now().minus(8, java.time.temporal.ChronoUnit.DAYS).toEpochMilli();
+        file1.toFile().setLastModified(eightDaysAgo);
+        votingExpired.toFile().setLastModified(eightDaysAgo);
+        file3.toFile().setLastModified(eightDaysAgo);
+        ledgerExpired.toFile().setLastModified(eightDaysAgo);
+        vcExpired.toFile().setLastModified(eightDaysAgo);
+
+        // Run cleanup
+        storageCleanupService.cleanupOldData();
+
+        // Assertions
+        assertFalse(Files.exists(votingExpired), "Expired voting session folder should be deleted");
+        assertTrue(Files.exists(votingActive), "Active voting session folder should exist");
+        assertFalse(Files.exists(ledgerExpired), "Expired ledger folder should be deleted");
+        assertFalse(Files.exists(vcExpired), "Expired VC file should be deleted");
+        assertTrue(Files.exists(vcActive), "Active VC file should exist");
+
+        // Cleanup the test files
+        try {
+            Files.deleteIfExists(file2);
+            Files.deleteIfExists(votingActive);
+            Files.deleteIfExists(vcActive);
+        } catch (Exception ignored) {}
     }
 }
 
