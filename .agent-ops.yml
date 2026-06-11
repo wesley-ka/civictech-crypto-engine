@@ -1,0 +1,10 @@
+# .agent-ops.yml
+build_command: "mvn clean compile"
+test_command: "mvn test"
+# Core files pre-loaded into Aider's context immediately on startup
+core_files:
+  - "pom.xml"
+  - "src/main/resources/application.yml"
+  - "src/main/java/com/civictech/crypto/engine/CivicTechCryptoEngineApplication.java"
+  - "src/main/java/com/civictech/crypto/engine/config/SecurityConfig.java"
+  - "src/main/java/com/civictech/crypto/engine/error/GlobalExceptionHandler.java"
