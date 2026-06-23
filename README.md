@@ -905,3 +905,18 @@ In production, you should override the ephemeral keys by injecting external conf
 1. **SSL/TLS Termination**: Always run this engine behind a TLS-terminating load balancer (e.g., Google Cloud HTTPS Load Balancer, AWS ALB) or reverse-proxy (NGINX) enforcing TLS 1.3.
 2. **Key Rotation**: Rotate the vault and signing keys regularly. In case of signing key rotation, register the previous public key as a valid historical verifier key in client applications.
 3. **Structured Logging**: Configure log output formats to JSON (such as Logstash Logback Encoder) to route metrics and logs directly to central log processors (e.g., Datadog, ELK, Google Cloud Logging).
+
+---
+
+## 8. Homelab deployment (homeserver)
+
+Production instance: **https://api.awka.dev/api** on a rootless Podman Quadlet host.
+
+| Topic | Detail |
+|-------|--------|
+| Deploy path | `/homelab/civictech-crypto-engine/` (CI-managed on server) |
+| Auto-deploy | Push to `main` or `master` → GitHub Actions self-hosted runner on homeserver |
+| Manual deploy | `bash scripts/deploy-homelab.sh` on homeserver |
+| First-time setup | `scripts/install-github-runner.sh`, `scripts/install-quadlet.sh`, copy `.env.example` → `.env` |
+
+See [deploy/README-homelab.md](deploy/README-homelab.md) for ingress (Cloudflare tunnel, NPM) and env var details.

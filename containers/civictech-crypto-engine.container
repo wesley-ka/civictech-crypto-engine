@@ -1,0 +1,18 @@
+[Unit]
+Description=CivicTech Cryptographic Engine API
+After=network-online.target
+
+[Container]
+ContainerName=civictech-crypto-engine
+Image=localhost/civictech-crypto-engine:latest
+PublishPort=8085:8080
+EnvironmentFile=/homelab/civictech-crypto-engine/.env
+Environment=TZ=Europe/Amsterdam
+Environment=PORT=8080
+Volume=civictech-crypto-engine-data.volume:/app/local-storage:rw
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target
