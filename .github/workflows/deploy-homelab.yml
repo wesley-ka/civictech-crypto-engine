@@ -1,0 +1,27 @@
+name: Deploy to homelab
+
+on:
+  push:
+    branches: [main, master]
+
+concurrency:
+  group: homelab-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, homeserver]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Sync to deploy path
+        run: |
+          rsync -a --delete \
+            --exclude '.git/' \
+            --exclude '.env' \
+            --exclude 'data/' \
+            --exclude 'config/' \
+            ./ /homelab/civictech-crypto-engine/
+
+      - name: Build and restart
+        run: bash /homelab/civictech-crypto-engine/scripts/deploy-homelab.sh
